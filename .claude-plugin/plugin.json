@@ -1,6 +1,6 @@
 {
   "name": "cache-hit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shows how much of each request's input is read back from the prompt cache, for the main session and its subagents",
   "license": "MIT",
   "types": "./types/index.d.ts"

@@ -1,0 +1,17 @@
+{
+  "name": "claude-code-cache-hit",
+  "owner": { "name": "raphael-homann" },
+  "metadata": {
+    "description": "Prompt cache hit rate of Claude Code sessions"
+  },
+  "plugins": [
+    {
+      "name": "cache-hit",
+      "source": "./",
+      "description": "Shows how much of each request's input is read back from the prompt cache, for the main session and its subagents",
+      "version": "0.3.0",
+      "license": "MIT",
+      "homepage": "https://github.com/raphael-homann/claude-code-cache-hit"
+    }
+  ]
+}

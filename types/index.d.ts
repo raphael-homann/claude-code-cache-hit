@@ -1,26 +1,29 @@
-/** Un appel au modèle : tokens relus depuis le cache sur le total des tokens d'entrée. */
-export type Call = { read: number; total: number; /** ms depuis l'époque, 0 si inconnu */ at?: number }
+/** One model request: input tokens read from the cache, out of all input tokens. */
+export type Call = { read: number; total: number; /** ms since the epoch, 0 when unknown */ at?: number }
 
-/** Ce que le panneau et la ligne de statut affichent. */
+/** Interface language. */
+export type Lang = 'en' | 'fr'
+
+/** What the band and the popup show. */
 export type Stats = {
-  /** Agent principal : somme de ses appels. */
+  /** Main agent: the sum of its requests. */
   own: Call
-  /** Nombre d'appels de l'agent principal. */
+  /** The main agent's number of requests. */
   ownCount: number
-  /** Ses derniers appels, du plus ancien au plus récent. */
+  /** Its latest requests, oldest first. */
   recent: Call[]
-  /** Sous-agents réunis. */
+  /** Subagents together. */
   subs: Call
-  /** Nombre de sous-agents ayant au moins un appel. */
+  /** Subagents with at least one request. */
   subCount: number
-  /** Derniers appels des sous-agents, tous ensemble, dans l'ordre chronologique. */
+  /** The subagents' latest requests, all together, in chronological order. */
   subRecent: Call[]
-  /** Raison pour laquelle rien n'est mesuré (jq absent, transcript introuvable). */
+  /** Why nothing is measured: `jq`, `transcript`, or an error message. */
   problem?: string
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    'cache-hit': { stats: Shaped<Stats>; popupOpen: Shaped<boolean> }
+    'cache-hit': { stats: Shaped<Stats>; popupOpen: Shaped<boolean>; lang: Shaped<Lang> }
   }
 }

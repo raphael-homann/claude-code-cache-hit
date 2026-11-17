@@ -1,28 +1,32 @@
-// Affiche la part des tokens d'entrée relus depuis le cache pour la session ouverte,
-// à la manière de opencode-cache-hit : une ligne cliquable au-dessus du prompt
-// (« cache 93% ●●●● ») qui ouvre une popup « Cache réutilisé ».
-// Source : les transcripts JSONL de la session (principal + subagents/agent-*.jsonl),
-// lus par morceaux par hooks/scan.sh (jq) pour tenir sur des fichiers de 100 Mo et plus.
+// Shows how much of each request's input is read back from the prompt cache, for the
+// open session: a clickable line above the prompt (« cache 93% ●●●● ») that opens a popup.
+// Source: the session's JSONL transcripts (main + subagents/agent-*.jsonl), read
+// incrementally by hooks/scan.sh (jq) so that 100 MB+ transcripts stay cheap.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Api, Register } from 'claude-code'
 
 import type { Call, Stats } from '../types'
 import { absorb, EMPTY, GOOD, k, MID, overall, pct, projectDirName, stats, tone } from './calc'
 import type { FileScan } from './calc'
+import { isLang, langFromLocale, otherLang, problemText, TEXTS } from './i18n'
+import type { Lang } from './i18n'
 
 const PANE = 'cache-hit'
-const TITLE = 'Cache réutilisé'
 const MIN_INTERVAL_MS = 1000
-/** Points affichés dans la ligne au-dessus du prompt. */
+/** Dots shown in the line above the prompt. */
 const BAND_DOTS = 12
-/** Largeur maximale des barres de la popup. */
+/** Maximum width of the popup bars. */
 const BAR_MAX = 40
+/** Width asked for the pane when docked beside the transcript: as wide as the inline block's content. */
+const DOCK_COLUMNS = BAR_MAX
 
 const statsAtom = atom({ plugin: 'cache-hit', key: 'stats' } as const, EMPTY, { shape: 'stats-2' })
-/** La popup est-elle ouverte : la ligne au-dessus du prompt dit « détails » ou « fermer ». */
+/** Whether the popup is open and drawn: the band then says « hide » instead of « details ». */
 const popupOpen = atom({ plugin: 'cache-hit', key: 'popupOpen' } as const, false, { shape: 'open-1' })
+/** Interface language, also kept in $.store across sessions. */
+const langAtom = atom({ plugin: 'cache-hit', key: 'lang' } as const, 'en' as Lang, { shape: 'lang-1' })
 
-// Ce qui suit repart de zéro à chaque rechargement du module : on relit alors tout.
+// Module state, reset on each reload of the module: everything is read again then.
 let sessionId: string | undefined
 let mainPath: string | undefined
 let mainScan: FileScan | undefined
@@ -39,7 +43,7 @@ async function projectsDir($: Api) {
   return `${(config || `${home}/.claude`).replace(/[\\/]$/, '')}/projects`
 }
 
-/** Le transcript de la session : d'abord là où Claude Code le range, sinon on le cherche. */
+/** The session's transcript: first where Claude Code keeps it, else searched for. */
 async function findTranscript($: Api, id: string) {
   const projects = await projectsDir($)
   const dirs = [await $.session.root(), await $.session.cwd()]
@@ -55,19 +59,25 @@ async function findTranscript($: Api, id: string) {
   return undefined
 }
 
-async function scanFile($: Api, path: string, scan: FileScan): Promise<FileScan> {
+/**
+ * Reads what was added to a transcript since `scan`. `size` is the file's size now
+ * (from `$.fs.list` or `$.fs.stat`): unchanged, the file is not read and no process runs.
+ */
+async function scanFile($: Api, path: string, scan: FileScan, size: number): Promise<FileScan> {
+  if (scan.size === size) return scan
   const { exitCode, stdout, stderr } = await $.process.run(
     ['sh', `${$.plugin.root}/hooks/scan.sh`, path, String(scan.from)],
     { timeoutMs: 60_000 },
   )
   if (exitCode !== 0) throw new Error(stderr.trim() || `scan.sh: code ${exitCode}`)
-  return absorb(scan, stdout)
+  // The size read before the scan: a file that grew meanwhile is read again next time.
+  return { ...absorb(scan, stdout), size }
 }
 
 async function refreshOnce($: Api) {
   const id = await $.session.id()
   if (id !== sessionId) {
-    // Nouvelle session (démarrage, /clear, reprise) : on repart de zéro.
+    // New session (start, /clear, resume): start over.
     sessionId = id
     mainPath = undefined
     mainScan = undefined
@@ -75,18 +85,19 @@ async function refreshOnce($: Api) {
   }
   mainPath ??= await findTranscript($, id)
   if (!mainPath) {
-    await publish($, { ...EMPTY, problem: 'transcript introuvable (pas encore de réponse ?)' })
+    await publish($, { ...EMPTY, problem: 'transcript' })
     return
   }
 
-  mainScan = await scanFile($, mainPath, mainScan ?? fresh())
+  const { size: mainSize } = await $.fs.stat(mainPath)
+  mainScan = await scanFile($, mainPath, mainScan ?? fresh(), mainSize)
 
   const subDir = `${mainPath.replace(/\.jsonl$/, '')}/subagents`
   const entries = await $.fs.list(subDir).catch(() => [])
   for (const entry of entries) {
     if (entry.kind !== 'file' || !/^agent-.*\.jsonl$/.test(entry.name)) continue
     const path = `${subDir}/${entry.name}`
-    subScans.set(path, await scanFile($, path, subScans.get(path) ?? fresh()))
+    subScans.set(path, await scanFile($, path, subScans.get(path) ?? fresh(), entry.size))
   }
 
   await publish($, stats(mainScan, [...subScans.values()]))
@@ -94,29 +105,49 @@ async function refreshOnce($: Api) {
 
 async function publish($: Api, next: Stats) {
   await update($, statsAtom, () => next)
-  // La v0.1 écrivait « cache N% » dans la ligne de statut, qui survit au rechargement :
-  // la ligne cliquable au-dessus du prompt la remplace.
+  // v0.1 wrote « cache N% » in the status line, which outlives a reload:
+  // the clickable line above the prompt replaces it.
   $.ui.status(undefined)
 }
 
-/** La popup : un panneau qui prend le clavier et se ferme avec Échap. */
-const openPopup = ($: Api) => {
+/** The language: the one chosen with `l`, else the locale's. */
+async function initialLang($: Api): Promise<Lang> {
+  const stored = await $.store.get('lang').catch(() => undefined)
+  if (isLang(stored)) return stored
+  const locale = (await $.env.get('LC_ALL')) || (await $.env.get('LC_MESSAGES')) || (await $.env.get('LANG'))
+  return langFromLocale(locale)
+}
+
+/**
+ * The popup: a pane that takes the keyboard and closes on Escape. Nothing is awaited
+ * before `$.ui.open`, so that an open from a click counts as the person's: it is then
+ * drawn at any terminal width (an unasked one waits undrawn below 144 columns).
+ */
+async function openPopup($: Api, lang: Lang) {
+  const opened = $.ui.open({
+    id: PANE,
+    title: TEXTS[lang].title,
+    focus: true,
+    closeOnEscape: true,
+    columns: DOCK_COLUMNS,
+  })
   void refresh($)
-  return $.ui.open({ id: PANE, title: TITLE, focus: true, closeOnEscape: true })
+  const { isPlaced } = await opened
+  await update($, popupOpen, () => isPlaced)
+  return isPlaced
 }
 
-/** Ouvre la popup, ou la referme si elle est déjà ouverte. Rend true si elle est ouverte. */
-async function togglePopup($: Api) {
-  const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
-  if (isOpen) {
-    await $.ui.close({ id: PANE })
-    return false
-  }
-  await openPopup($)
-  return true
+async function closePopup($: Api) {
+  await $.ui.close({ id: PANE })
+  await update($, popupOpen, () => false)
 }
 
-/** Relit les transcripts ; les demandes faites pendant une lecture sont regroupées. */
+/** Whether the popup is really on screen: listed, drawn and the pane shown. */
+async function isPopupShown($: Api) {
+  return (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced && pane.isShown)
+}
+
+/** Reads the transcripts again; requests made during a read are coalesced. */
 function refresh($: Api): Promise<void> {
   dirty = true
   if (running) return running
@@ -131,8 +162,8 @@ function refresh($: Api): Promise<void> {
           await refreshOnce($)
         } catch (err) {
           const message = String(err instanceof Error ? err.message : err)
-          const problem = /jq/.test(message) ? 'jq est nécessaire (apt install jq / brew install jq)' : message
-          // Lancée sans attendre (void refresh) : rien ne doit remonter d'ici.
+          const problem = /jq/.test(message) ? 'jq' : message
+          // Started without awaiting (void refresh): nothing may escape from here.
           await publish($, { ...EMPTY, problem }).catch(() => undefined)
         }
       }
@@ -146,27 +177,30 @@ function refresh($: Api): Promise<void> {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    await $.command.register({
-      name: 'cache',
-      description: 'Afficher ou masquer la popup « Cache réutilisé »',
-    })
+    const lang = await initialLang($)
+    await update($, langAtom, () => lang)
+    await $.command.register({ name: 'cache', description: TEXTS[lang].commandDescription })
     void refresh($)
     return started
   })
 
-  on('command.run', { command: 'cache' }, async $ =>
-    (await togglePopup($))
-      ? { text: 'Popup « Cache réutilisé » ouverte (Échap pour fermer).' }
-      : { text: 'Popup « Cache réutilisé » fermée.' },
-  )
+  on('command.run', { command: 'cache' }, async $ => {
+    const lang = await read($, langAtom)
+    if (await isPopupShown($)) {
+      await closePopup($)
+      return { text: TEXTS[lang].closed }
+    }
+    await openPopup($, lang)
+    return { text: TEXTS[lang].opened }
+  })
 
-  // Après chaque appel d'outil (une réponse du modèle vient d'être écrite) et en fin de tour,
-  // de l'agent principal comme des sous-agents.
+  // After each tool call (a model response was just written) and at the end of each
+  // turn, the main agent's as well as the subagents'.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     void refresh($)
     return ran
-  }).catch(($, e, next) => next(e)) // un échec du mod ne doit jamais bloquer un outil
+  }).catch(($, e, next) => next(e)) // a failure of this mod must never block a tool
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
@@ -174,36 +208,34 @@ export const register: Register = on => {
     return done
   })
 
-  // Suit l'ouverture et la fermeture de la popup, Échap et croix comprises.
-  on('ui.open', async ($, e, next) => {
-    const opened = await next(e)
-    if (e.id === PANE && opened.value?.isPlaced) await update($, popupOpen, () => true)
-    return opened
-  })
-
+  // A close by the person (Escape, the cross): the band says « details » again.
   on('ui.close', async ($, e, next) => {
     const closed = await next(e)
     if (e.id === PANE) await update($, popupOpen, () => false)
     return closed
   })
 
-  // La ligne au-dessus du prompt : un clic (ou Entrée quand elle a le focus) ouvre la popup.
+  // The line above the prompt: a click (or Enter while it has the focus) opens or closes the popup.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.plugin !== $.plugin.name || e.props.hasSurvey) return next(e)
     const s = await read($, statsAtom)
     if (s.problem || s.ownCount === 0) return next(e)
     const { Button, Text } = $.ui.resolve(e)
     const isOpen = await read($, popupOpen)
+    const lang = await read($, langAtom)
+    const t = TEXTS[lang]
     const all = overall(s)
+    // Decided from what is drawn, with no await before the open (see openPopup).
+    const press = () => void (isOpen ? closePopup($) : openPopup($, lang))
     return (
-      <Button key="cache-hit" plain onPress={() => void togglePopup($)}>
+      <Button key="cache-hit" plain onPress={press}>
         <Text dimColor>cache </Text>
         <Text color={tone(all)}>{`${pct(all)}%`}</Text>
         <Text> </Text>
         {s.recent.slice(-BAND_DOTS).map(c => (
           <Text color={tone(c)}>●</Text>
         ))}
-        <Text dimColor>{isOpen ? ' · fermer' : ' · détails'}</Text>
+        <Text dimColor>{` · ${isOpen ? t.hide : t.details}`}</Text>
       </Button>
     )
   })
@@ -211,17 +243,50 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const s = await read($, statsAtom)
-    const close = <Button role="dismiss" hotkey="q" onPress={() => void $.ui.close({ id: PANE })}>Fermer</Button>
+    const lang = await read($, langAtom)
+    const t = TEXTS[lang]
 
-    if (s.problem) return <Box flexDirection="column" gap={1}><Text dimColor>{s.problem}</Text>{close}</Box>
+    // `l` switches the language: kept for the next sessions, the popup retitled.
+    const switchLang = async () => {
+      const next = otherLang(lang)
+      await update($, langAtom, () => next)
+      await $.store.set('lang', next).catch(() => undefined)
+      await $.ui.open({ id: PANE, title: TEXTS[next].title, closeOnEscape: true, columns: DOCK_COLUMNS })
+    }
+    const buttons = (
+      <Box flexDirection="row" gap={2}>
+        <Button role="dismiss" hotkey="q" onPress={() => void closePopup($)}>
+          {t.close}
+        </Button>
+        <Button key="lang" hotkey="l" onPress={() => void switchLang()}>
+          {t.switchTo}
+        </Button>
+      </Box>
+    )
+
+    if (s.problem)
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text dimColor>{problemText(t, s.problem)}</Text>
+          {buttons}
+        </Box>
+      )
     if (s.ownCount === 0)
-      return <Box flexDirection="column" gap={1}><Text dimColor>En attente d'une première réponse…</Text>{close}</Box>
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text dimColor>{t.waiting}</Text>
+          {buttons}
+        </Box>
+      )
 
-    const columns = e.props.bodyColumns ?? 40
-    const width = Math.max(10, Math.min(BAR_MAX, columns - 2))
+    const columns = e.props.bodyColumns ?? BAR_MAX
+    const width = Math.max(10, Math.min(BAR_MAX, columns))
+    // Narrow (the docked pane): short labels, a compact legend and total.
+    const isNarrow = width < BAR_MAX
+    const fits = (label: string, short: string) => (label.length <= width - 5 ? label : short)
 
-    // Par session : « Libellé        74% », la barre ━━━━━━──── colorée selon les seuils,
-    // puis un point par requête récente, sur la largeur de la barre.
+    // Per session: « Label        74% », the bar ━━━━━━──── colored by the thresholds,
+    // then one dot per recent request, as wide as the bar.
     const session = (label: string, value: Call, recent: readonly Call[]) => {
       const p = pct(value)
       const color = tone(value)
@@ -248,22 +313,37 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1}>
-        {session(`Session principale (${s.ownCount})`, s.own, s.recent)}
-        {s.subCount > 0
-          ? session(`Sous-agents (${s.subCount})`, s.subs, s.subRecent)
-          : <Text dimColor>Sous-agents : aucun dans cette session</Text>}
+        {session(fits(t.main(s.ownCount), t.mainShort), s.own, s.recent)}
+        {s.subCount > 0 ? (
+          session(fits(t.subs(s.subCount), t.subsShort), s.subs, s.subRecent)
+        ) : (
+          <Text dimColor>{t.noSubs}</Text>
+        )}
         <Box flexDirection="column">
-          <Box flexDirection="row">
-            <Text color="success">●</Text>
-            <Text dimColor>{` ≥ ${GOOD}%  `}</Text>
-            <Text color="warning">●</Text>
-            <Text dimColor>{` ${MID}–${GOOD}%  `}</Text>
-            <Text color="error">●</Text>
-            <Text dimColor>{` < ${MID}% (cache perdu)`}</Text>
-          </Box>
-          <Text dimColor>{`Total ${pct(all)}% · ${k(all.read)} sur ${k(all.total)} tokens relus`}</Text>
+          {isNarrow ? (
+            <Box flexDirection="row">
+              <Text color="success">●</Text>
+              <Text dimColor>{` ≥${GOOD}% `}</Text>
+              <Text color="warning">●</Text>
+              <Text dimColor>{` ${MID}–${GOOD}% `}</Text>
+              <Text color="error">●</Text>
+              <Text dimColor>{` <${MID}%`}</Text>
+            </Box>
+          ) : (
+            <Box flexDirection="row">
+              <Text color="success">●</Text>
+              <Text dimColor>{` ≥ ${GOOD}%  `}</Text>
+              <Text color="warning">●</Text>
+              <Text dimColor>{` ${MID}–${GOOD}%  `}</Text>
+              <Text color="error">●</Text>
+              <Text dimColor>{` < ${MID}% (${t.lost})`}</Text>
+            </Box>
+          )}
+          <Text dimColor>
+            {(isNarrow ? t.totalShort : t.total)(pct(all), k(all.read), k(all.total))}
+          </Text>
         </Box>
-        {close}
+        {buttons}
       </Box>
     )
   })

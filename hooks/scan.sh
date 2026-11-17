@@ -1,9 +1,9 @@
 #!/bin/sh
-# Lit la suite d'un transcript JSONL de Claude Code, à partir de la ligne $2 (0 = début).
-# Première ligne de sortie : le nombre de lignes complètes du fichier (prochain $2).
-# Puis une ligne par appel au modèle : [id, input, cache_read, cache_write, horodatage ISO].
-# Seules les lignes terminées par un saut de ligne sont lues : une ligne en cours
-# d'écriture l'est au passage suivant.
+# Reads the rest of a Claude Code JSONL transcript, from line $2 (0 = the top).
+# First output line: the file's number of complete lines (the next $2).
+# Then one line per model response: [id, input, cache_read, cache_write, ISO timestamp].
+# Only lines ending with a newline are read: a line still being written is read
+# on the next pass.
 f=$1
 from=${2:-0}
 if [ ! -f "$f" ]; then echo 0; exit 0; fi
