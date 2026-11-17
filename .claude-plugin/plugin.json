@@ -1,7 +1,7 @@
 {
   "name": "cache-hit",
   "version": "0.2.0",
-  "description": "Part des tokens relus depuis le cache (prompt caching) pour la session : agent principal, sous-agents, derniers appels",
+  "description": "Shows how much of each request's input is read back from the prompt cache, for the main session and its subagents",
   "license": "MIT",
   "types": "./types/index.d.ts"
 }

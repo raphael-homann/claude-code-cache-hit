@@ -1,19 +1,24 @@
-# cache-hit pour Claude Code
+# Claude Code Cache Hit
 
-Port pour Claude Code de [opencode-cache-hit](https://github.com/Lucas-Rosenzweig/opencode-cache-hit) (Lucas Rosenzweig).
-Le mod affiche **la part des tokens relus depuis le cache** (prompt caching) pour la session ouverte.
+A [Claude Code](https://claude.com/claude-code) mod that shows **how much of each request's input is read back from the prompt cache**, for the main session and its subagents.
 
-Au-dessus du prompt, une ligne cliquable donne le taux total et les dernières requêtes :
+Port of [opencode-cache-hit](https://github.com/Lucas-Rosenzweig/opencode-cache-hit) by Lucas Rosenzweig, the same idea for OpenCode.
+
+![The "Cache réutilisé" popup in Claude Code](docs/popup.png)
+
+## Why
+
+A low cache hit rate means more quota spent and slower answers. This mod shows when the cache gets lost: a pause longer than the cache lifetime, a model, MCP or system prompt change mid-session, or subagents that start cold.
+
+## What it shows
+
+A clickable line above the prompt carries the overall rate and the latest requests:
 
 ```
-cache 93% ●●●●●●●●●●●● · détails
+cache 96% ●●●●●●●●●●●● · détails
 ```
 
-Un clic dessus (ou `/cache`) ouvre la popup « Cache réutilisé » ; un second clic, Échap, `q` ou « Fermer » la referment.
-
-![La popup « Cache réutilisé » dans Claude Code](docs/popup.png)
-
-Pour chaque session (principale, puis sous-agents réunis) : le taux, une barre de remplissage, et dessous un point par requête récente, sur la largeur de la barre :
+Click it (or run `/cache`) to open the popup. Click it again, press Escape or `q`, or hit « Fermer » to close it.
 
 ```
 Session principale (67)          96%
@@ -29,33 +34,56 @@ Total 96% · 8.1M sur 8.5M tokens relus
 [ Fermer ]
 ```
 
-Il sert à voir quand le cache se perd (pause de plus de 5 min, changement de modèle, de MCP ou de system prompt en cours de session…) : un taux bas veut dire plus de quota consommé et des réponses plus lentes.
+| Part | Meaning |
+|---|---|
+| **Session principale (N)** | The conversation you type in, with its number of requests. |
+| **Sous-agents (N)** | All subagents of the session together, with how many there are. |
+| **Bar** | Share of input tokens read from the cache. |
+| **Dots** | One dot per recent request, as wide as the bar. Subagent requests are put back in chronological order, even when the subagents ran in parallel. |
+| **Total** | Main session and subagents together: what the session really consumed. |
 
-## Utilisation
+Colors: green ≥ 80 %, orange 50–80 %, red < 50 %. Red also marks a lost cache: a request over 5,000 tokens with less than half of them read from the cache. The thresholds are `GOOD` and `MID` in `hooks/calc.ts`.
 
-- Clic sur la ligne `cache …` au-dessus du prompt (ou Entrée quand elle a le focus, `ctrl+x tab`) : ouvre ou referme la popup.
-- `/cache` : pareil, au clavier.
-- Seuils : vert ≥ 80 %, orange 50–80 %, rouge < 50 %. Ils sont réglables dans `hooks/calc.ts` (`GOOD`, `MID`).
+The interface is in French for now.
 
-## Calcul
+## Install
 
-Pour chaque réponse du modèle, à partir de `message.usage` dans les transcripts de la session :
+Requirements: a recent Claude Code with mods (hooks modules), `sh` and [`jq`](https://jqlang.org) (`apt install jq` / `brew install jq`).
+
+In Claude Code:
+
+```
+/plugin marketplace add OWNER/REPO
+/plugin install cache-hit@cache-hit
+```
+
+Or try it in a single session from a clone:
+
+```bash
+git clone https://github.com/OWNER/REPO.git
+claude --plugin-dir ./REPO
+```
+
+## How it works
+
+For each model response, from `message.usage` in the session transcripts:
 
 ```
 cache_read_input_tokens / (input_tokens + cache_read_input_tokens + cache_creation_input_tokens)
 ```
 
-- Agent principal : `~/.claude/projects/<projet>/<session>.jsonl`. Sous-agents : `<session>/subagents/agent-*.jsonl`, leurs requêtes remises dans l'ordre chronologique.
-- Claude Code écrit une ligne par bloc de contenu d'une même réponse : les appels sont dédoublonnés par `message.id`.
+- Main session: `~/.claude/projects/<project>/<session>.jsonl`. Subagents: `<session>/subagents/agent-*.jsonl`.
+- Claude Code writes one transcript line per content block of a response, all with the same usage, so requests are deduplicated by `message.id`.
+- `hooks/scan.sh` reads only the lines added since its last pass, so transcripts over 100 MB stay cheap. A line still being written is read on the next pass.
+- Figures refresh after each tool call and at the end of each turn, at most once per second.
 
-## Prérequis
+## Development
 
-`jq` et `sh` (`apt install jq` / `brew install jq`). Le script `hooks/scan.sh` ne relit que les lignes ajoutées depuis le dernier passage, ce qui tient sur des transcripts de plus de 100 Mo.
+```bash
+claude plugin validate .
+claude plugin test .
+```
 
-## Limites
-
-- Les chiffres sont recalculés après chaque appel d'outil et en fin de tour, au plus une fois par seconde.
-
-## Licence
+## License
 
 MIT
